@@ -8,3 +8,6 @@ identity.egg-info/dependency_links.txt
 identity.egg-info/requires.txt
 identity.egg-info/top_level.txt
 tests/test_health.py
+tests/test_identity.py
+tests/test_persistence.py
+tests/test_sso.py

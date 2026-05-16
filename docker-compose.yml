@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: identity
+      POSTGRES_USER: identity
+      POSTGRES_PASSWORD: identity
+    ports:
+      - "127.0.0.1:5530:5432"
+  migrator:
+    build: .
+    env_file: [.env]
+    command: ["alembic", "upgrade", "head"]
+    depends_on: [postgres]
+  api:
+    build: .
+    env_file: [.env]
+    depends_on: [migrator]
+    ports:
+      - "127.0.0.1:8300:8300"
