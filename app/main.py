@@ -1,3 +1,4 @@
+import os
 from uuid import uuid4
 from fastapi import Cookie, FastAPI, HTTPException, Response, status
 from pydantic import BaseModel
@@ -6,6 +7,8 @@ app = FastAPI(title="identity")
 subjects: dict[str, str] = {}
 sessions: dict[str, str] = {}
 COOKIE_NAME = 'ecosystem_session'
+COOKIE_DOMAIN = os.getenv('IDENTITY_COOKIE_DOMAIN') or None
+COOKIE_SECURE = os.getenv('IDENTITY_COOKIE_SECURE', 'false').lower() == 'true'
 
 class SubjectCreate(BaseModel):
     email: str
@@ -31,15 +34,7 @@ def create_session(payload: SessionCreate):
 def create_browser_session(payload: SessionCreate, response: Response):
     session_id = f'sess_{uuid4().hex}'
     sessions[session_id] = payload.subject_id
-    response.set_cookie(
-        COOKIE_NAME,
-        session_id,
-        httponly=True,
-        secure=True,
-        samesite='lax',
-        domain='.example.com',
-        path='/',
-    )
+    response.set_cookie(COOKIE_NAME, session_id, httponly=True, secure=COOKIE_SECURE, samesite='lax', domain=COOKIE_DOMAIN, path='/')
     return {'session_id': session_id, 'subject_id': payload.subject_id}
 
 @app.post('/api/v1/session-exchange')
@@ -51,5 +46,5 @@ def exchange_session(ecosystem_session: str | None = Cookie(default=None)):
 
 @app.post('/api/v1/logout')
 def logout(response: Response):
-    response.delete_cookie(COOKIE_NAME, domain='.example.com', path='/')
+    response.delete_cookie(COOKIE_NAME, domain=COOKIE_DOMAIN, path='/')
     return {'ok': True}
