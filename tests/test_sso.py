@@ -20,3 +20,9 @@ def test_logout_clears_shared_cookie():
     response = client.post('/api/v1/logout')
     assert response.status_code == 200
     assert 'ecosystem_session=""' in response.headers['set-cookie']
+
+
+def test_internal_session_mint_preserves_existing_subject_id():
+    response = client.post('/api/v1/internal/browser-sessions', json={'subject_id': 'planner-user-1'}, headers={'x-internal-key': 'dev-internal-key'})
+    assert response.status_code == 201
+    assert response.json()['subject_id'] == 'planner-user-1'
