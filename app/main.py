@@ -86,6 +86,11 @@ def login_page(return_to: str = 'https://planner.nerior.ru/'):
         error.textContent = 'Не удалось войти. Проверьте логин и пароль.';
         return;
       }}
+      const payload = await response.json();
+      if (payload.requires_twofa) {{
+        location.href = payload.legacy_login_url;
+        return;
+      }}
       location.href = data.get('return_to');
     }});
   </script>
@@ -108,7 +113,7 @@ def login(payload: LoginRequest, response: Response, session: SessionDep):
         raise HTTPException(status_code=planner_response.status_code, detail='planner login failed')
     data = planner_response.json().get('data') or {}
     if data.get('requires_twofa'):
-        raise HTTPException(status_code=409, detail='twofa must be completed in planner')
+        return {'requires_twofa': True, 'legacy_login_url': 'https://planner.nerior.ru/login?legacy=1'}
     user_id, email = data.get('user_id'), data.get('email')
     if not user_id or not email:
         raise HTTPException(status_code=502, detail='invalid planner login response')
