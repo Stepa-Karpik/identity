@@ -5,17 +5,26 @@ services:
       POSTGRES_DB: identity
       POSTGRES_USER: identity
       POSTGRES_PASSWORD: identity
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U identity -d identity"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     ports:
       - "127.0.0.1:5530:5432"
   migrator:
     build: .
     env_file: [.env]
     command: ["alembic", "upgrade", "head"]
-    depends_on: [postgres]
+    depends_on:
+      postgres:
+        condition: service_healthy
   api:
     build: .
     env_file: [.env]
-    depends_on: [migrator]
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
     ports:
       - "127.0.0.1:8300:8300"
     networks:
