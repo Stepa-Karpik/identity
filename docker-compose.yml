@@ -18,3 +18,11 @@ services:
     depends_on: [migrator]
     ports:
       - "127.0.0.1:8300:8300"
+    networks:
+      default:
+      ecosystem:
+        aliases: [identity]
+
+networks:
+  ecosystem:
+    external: true

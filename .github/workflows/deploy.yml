@@ -38,6 +38,7 @@ jobs:
             set -e
             cd /opt/identity
             git pull origin main
+            docker network inspect ecosystem >/dev/null 2>&1 || docker network create ecosystem
             docker compose up -d --build
             docker image prune -f
           "
