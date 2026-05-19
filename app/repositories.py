@@ -1,10 +1,10 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from app.models import BrowserSessionModel, SubjectModel
+from app.models import BrowserSessionModel, SubjectModel, TelegramLinkModel, TwoFALoginSessionModel
 
 
 class IdentityRepository:
@@ -20,6 +20,33 @@ class IdentityRepository:
             self.session.refresh(subject)
         return subject
 
+    def upsert_account(
+        self,
+        *,
+        subject_id: str,
+        email: str,
+        username: str | None,
+        password_hash: str | None,
+        display_name: str | None = None,
+        twofa_method: str = 'none',
+        twofa_totp_secret: str | None = None,
+        twofa_last_totp_step: int | None = None,
+    ) -> SubjectModel:
+        subject = self.session.get(SubjectModel, subject_id)
+        if subject is None:
+            subject = SubjectModel(id=subject_id, email=email)
+            self.session.add(subject)
+        subject.email = email.lower()
+        subject.username = username.lower() if username else None
+        subject.password_hash = password_hash
+        subject.display_name = display_name
+        subject.twofa_method = twofa_method or 'none'
+        subject.twofa_totp_secret = twofa_totp_secret
+        subject.twofa_last_totp_step = twofa_last_totp_step
+        self.session.commit()
+        self.session.refresh(subject)
+        return subject
+
     def create_subject(self, *, email: str) -> SubjectModel:
         existing = self.session.scalar(select(SubjectModel).where(SubjectModel.email == email))
         if existing is not None:
@@ -32,6 +59,57 @@ class IdentityRepository:
 
     def get_subject(self, subject_id: str) -> SubjectModel | None:
         return self.session.get(SubjectModel, subject_id)
+
+    def get_subject_by_login(self, login: str) -> SubjectModel | None:
+        normalized = login.strip().lower()
+        return self.session.scalar(select(SubjectModel).where(or_(SubjectModel.email == normalized, SubjectModel.username == normalized)))
+
+    def update_last_totp_step(self, subject_id: str, step: int) -> None:
+        subject = self.get_subject(subject_id)
+        assert subject is not None
+        subject.twofa_last_totp_step = step
+        self.session.commit()
+
+    def upsert_telegram_link(self, *, subject_id: str, chat_id: int, username: str | None) -> TelegramLinkModel:
+        link = self.session.get(TelegramLinkModel, subject_id)
+        if link is None:
+            link = TelegramLinkModel(subject_id=subject_id, telegram_chat_id=chat_id, telegram_username=username)
+            self.session.add(link)
+        else:
+            link.telegram_chat_id = chat_id
+            link.telegram_username = username
+        self.session.commit()
+        self.session.refresh(link)
+        return link
+
+    def get_telegram_link_by_subject(self, subject_id: str) -> TelegramLinkModel | None:
+        return self.session.get(TelegramLinkModel, subject_id)
+
+    def get_telegram_link_by_chat(self, chat_id: int) -> TelegramLinkModel | None:
+        return self.session.scalar(select(TelegramLinkModel).where(TelegramLinkModel.telegram_chat_id == chat_id))
+
+    def create_twofa_session(self, *, subject_id: str, method: str) -> TwoFALoginSessionModel:
+        record = TwoFALoginSessionModel(
+            id=f'tfa_{uuid4().hex}',
+            subject_id=subject_id,
+            method=method,
+            status='pending',
+            attempts=0,
+            sent_to_telegram=0,
+            expires_at=datetime.now(UTC) + timedelta(minutes=10),
+        )
+        self.session.add(record)
+        self.session.commit()
+        self.session.refresh(record)
+        return record
+
+    def get_twofa_session(self, session_id: str) -> TwoFALoginSessionModel | None:
+        return self.session.get(TwoFALoginSessionModel, session_id)
+
+    def save_twofa_session(self, record: TwoFALoginSessionModel) -> TwoFALoginSessionModel:
+        self.session.commit()
+        self.session.refresh(record)
+        return record
 
     def create_browser_session(self, *, subject_id: str) -> BrowserSessionModel:
         session = BrowserSessionModel(id=f'sess_{uuid4().hex}', subject_id=subject_id)
