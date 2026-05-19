@@ -50,7 +50,8 @@ def login_page(return_to: str = 'https://planner.nerior.ru/'):
 <p id="error"></p>
 </main><script>
 const loginForm=document.getElementById('login-form'),totpForm=document.getElementById('totp-form'),telegramBox=document.getElementById('telegram-box'),requestBtn=document.getElementById('telegram-request'),error=document.getElementById('error'),title=document.getElementById('title');let challenge=null;let returnTo=new FormData(loginForm).get('return_to');
-function fail(t){{error.textContent=t||'Ошибка входа'}}function finish(){{location.href=returnTo}}
+function normalizeReturnTo(value){{try{{const u=new URL(value||'https://planner.nerior.ru/today', location.href);if(u.hostname==='auth.nerior.ru')return 'https://planner.nerior.ru/today';return u.href}}catch{{return 'https://planner.nerior.ru/today'}}}}
+function fail(t){{error.textContent=t||'Ошибка входа'}}function finish(){{location.href=normalizeReturnTo(returnTo)}}
 loginForm.addEventListener('submit',async e=>{{e.preventDefault();error.textContent='';const d=new FormData(loginForm);const r=await fetch('/api/v1/login',{{method:'POST',credentials:'include',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{login:d.get('login'),password:d.get('password')}})}});if(!r.ok)return fail('Не удалось войти. Проверьте логин и пароль.');const p=await r.json();if(!p.requires_twofa)return finish();challenge=p;loginForm.classList.add('hidden');title.textContent='Двухфакторная аутентификация';if(p.twofa_method==='totp')totpForm.classList.remove('hidden');else{{telegramBox.classList.remove('hidden');await requestTelegram();pollTelegram();}}}});
 totpForm.addEventListener('submit',async e=>{{e.preventDefault();const code=new FormData(totpForm).get('code');const r=await fetch('/api/v1/twofa/totp/verify',{{method:'POST',credentials:'include',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{twofa_session_id:challenge.twofa_session_id,code}})}});if(!r.ok)return fail('Неверный код или сессия истекла.');finish();}});
 async function requestTelegram(){{await fetch('/api/v1/twofa/telegram/request',{{method:'POST',credentials:'include',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{twofa_session_id:challenge.twofa_session_id}})}})}}
@@ -361,10 +362,18 @@ def create_browser_session(payload: SessionCreate, response: Response, session: 
 
 @app.post('/api/v1/session-exchange')
 def exchange_session(session: SessionDep, ecosystem_session: str | None = Cookie(default=None)):
-    browser_session = IdentityRepository(session).get_active_browser_session(ecosystem_session or '')
+    repo = IdentityRepository(session)
+    browser_session = repo.get_active_browser_session(ecosystem_session or '')
     if browser_session is None:
         raise HTTPException(status_code=401, detail='invalid session')
-    return {'subject_id': browser_session.subject_id, 'access_token': f'access_{browser_session.id}'}
+    subject = repo.get_subject(browser_session.subject_id)
+    return {
+        'subject_id': browser_session.subject_id,
+        'access_token': f'access_{browser_session.id}',
+        'email': getattr(subject, 'email', None),
+        'username': getattr(subject, 'username', None),
+        'display_name': getattr(subject, 'display_name', None),
+    }
 
 @app.post('/api/v1/logout')
 def logout(response: Response, session: SessionDep, ecosystem_session: str | None = Cookie(default=None)):
