@@ -40,6 +40,20 @@ class TelegramLinkModel(Base):
     linked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 
+class TwoFAPendingActionModel(Base):
+    __tablename__ = 'twofa_pending_actions'
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    subject_id: Mapped[str] = mapped_column(String(128), index=True)
+    chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    method: Mapped[str] = mapped_column(String(16))
+    action: Mapped[str] = mapped_column(String(24))
+    status: Mapped[str] = mapped_column(String(16), default='pending')
+    secret: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+
 class TwoFALoginSessionModel(Base):
     __tablename__ = 'twofa_login_sessions'
 

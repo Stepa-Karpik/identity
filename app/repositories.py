@@ -4,7 +4,7 @@ from uuid import uuid4
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from app.models import BrowserSessionModel, SubjectModel, TelegramLinkModel, TwoFALoginSessionModel
+from app.models import BrowserSessionModel, SubjectModel, TelegramLinkModel, TwoFALoginSessionModel, TwoFAPendingActionModel
 
 
 class IdentityRepository:
@@ -69,6 +69,54 @@ class IdentityRepository:
         assert subject is not None
         subject.twofa_last_totp_step = step
         self.session.commit()
+
+    def update_twofa_settings(
+        self,
+        subject: SubjectModel,
+        *,
+        method: str | None = None,
+        totp_secret: str | None = None,
+        clear_totp_secret: bool = False,
+        last_totp_step: int | None = None,
+        clear_last_totp_step: bool = False,
+    ) -> SubjectModel:
+        if method is not None:
+            subject.twofa_method = method
+        if clear_totp_secret:
+            subject.twofa_totp_secret = None
+        elif totp_secret is not None:
+            subject.twofa_totp_secret = totp_secret
+        if clear_last_totp_step:
+            subject.twofa_last_totp_step = None
+        elif last_totp_step is not None:
+            subject.twofa_last_totp_step = last_totp_step
+        self.session.commit()
+        self.session.refresh(subject)
+        return subject
+
+    def create_pending_action(self, *, subject_id: str, method: str, action: str, chat_id: int | None = None, secret: str | None = None, ttl_seconds: int = 300) -> TwoFAPendingActionModel:
+        record = TwoFAPendingActionModel(
+            id=uuid4().hex,
+            subject_id=subject_id,
+            chat_id=chat_id,
+            method=method,
+            action=action,
+            status='pending',
+            secret=secret,
+            expires_at=datetime.now(UTC) + timedelta(seconds=ttl_seconds),
+        )
+        self.session.add(record)
+        self.session.commit()
+        self.session.refresh(record)
+        return record
+
+    def get_pending_action(self, pending_id: str) -> TwoFAPendingActionModel | None:
+        return self.session.get(TwoFAPendingActionModel, pending_id)
+
+    def save_pending_action(self, record: TwoFAPendingActionModel) -> TwoFAPendingActionModel:
+        self.session.commit()
+        self.session.refresh(record)
+        return record
 
     def upsert_telegram_link(self, *, subject_id: str, chat_id: int, username: str | None) -> TelegramLinkModel:
         link = self.session.get(TelegramLinkModel, subject_id)

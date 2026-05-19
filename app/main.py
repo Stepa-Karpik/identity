@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.db import get_session
 from app.planner_migration import migrate_from_planner_database
 from app.repositories import IdentityRepository
-from app.security import verify_password, verify_totp
+from app.security import generate_totp_secret, verify_password, verify_totp
 from app import twofa as twofa_client
 
 app = FastAPI(title='identity')
@@ -27,6 +27,9 @@ class LoginRequest(BaseModel): login: str; password: str
 class TotpVerifyRequest(BaseModel): twofa_session_id: str; code: str
 class TelegramSessionRequest(BaseModel): twofa_session_id: str
 class TelegramCallbackRequest(BaseModel): chat_id: int; twofa_session_id: str; decision: Literal['approve','deny']
+class TwoFASetMethodRequest(BaseModel): method: Literal['none','telegram','totp']
+class TotpSetupVerifyRequest(BaseModel): pending_id: str; code: str
+class TotpDisableRequest(BaseModel): code: str
 class AccountUpsert(BaseModel):
     subject_id: str; email: str; username: str | None = None; password_hash: str | None = None; display_name: str | None = None
     twofa_method: str = 'none'; twofa_totp_secret: str | None = None; twofa_last_totp_step: int | None = None
@@ -62,6 +65,54 @@ def _mint_session(response: Response, repo: IdentityRepository, subject_id: str)
     browser_session = repo.create_browser_session(subject_id=subject_id)
     _set_cookie(response, browser_session.id)
     return {'ok': True, 'subject_id': subject_id}
+
+
+
+def _require_internal(x_internal_key: str | None) -> None:
+    if x_internal_key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail='invalid internal key')
+
+
+def _normalize_twofa_method(value: str | None) -> str:
+    value = (value or 'none').lower()
+    return value if value in {'none', 'telegram', 'totp'} else 'none'
+
+
+def _settings_payload(repo: IdentityRepository, subject_id: str) -> dict:
+    subject = repo.get_subject(subject_id)
+    if subject is None:
+        raise HTTPException(status_code=404, detail='subject not found')
+    link = repo.get_telegram_link_by_subject(subject_id)
+    return {
+        'twofa_method': _normalize_twofa_method(subject.twofa_method),
+        'telegram_linked': link is not None,
+        'telegram_confirmed': link is not None,
+        'totp_enabled': bool(subject.twofa_totp_secret),
+    }
+
+
+def _pending_payload(pending) -> dict:
+    return {
+        'pending_id': pending.id,
+        'method': pending.method,
+        'action': pending.action,
+        'status': pending.status,
+        'expires_at': pending.expires_at.isoformat(),
+    }
+
+
+def _expire_pending_if_needed(repo: IdentityRepository, pending):
+    if pending.status == 'pending' and _as_utc(pending.expires_at) < datetime.now(UTC):
+        pending.status = 'expired'
+        repo.save_pending_action(pending)
+    return pending
+
+
+def _normalize_code(code: str) -> str:
+    digits = ''.join(ch for ch in str(code) if ch.isdigit())
+    if len(digits) != 6:
+        raise HTTPException(status_code=400, detail='totp code must contain 6 digits')
+    return digits
 
 @app.post('/api/v1/login')
 def login(payload: LoginRequest, response: Response, session: SessionDep):
@@ -130,15 +181,142 @@ def internal_telegram_callback(payload: TelegramCallbackRequest, session: Sessio
         raise HTTPException(status_code=401, detail='invalid internal key')
     repo = IdentityRepository(session)
     twofa = repo.get_twofa_session(payload.twofa_session_id)
-    if twofa is None or twofa.method != 'telegram':
+    if twofa is not None:
+        if twofa.method != 'telegram':
+            return {'status': 'expired'}
+        link = repo.get_telegram_link_by_subject(twofa.subject_id)
+        if link is None or int(link.telegram_chat_id) != int(payload.chat_id):
+            raise HTTPException(status_code=401, detail='telegram chat mismatch')
+        if twofa.status == 'pending':
+            twofa.status = 'approved' if payload.decision == 'approve' else 'denied'
+            repo.save_twofa_session(twofa)
+        return {'status': twofa.status}
+
+    pending = repo.get_pending_action(payload.twofa_session_id)
+    if pending is None or pending.method != 'telegram':
         return {'status': 'expired'}
-    link = repo.get_telegram_link_by_subject(twofa.subject_id)
-    if link is None or int(link.telegram_chat_id) != int(payload.chat_id):
+    pending = _expire_pending_if_needed(repo, pending)
+    if pending.status != 'pending':
+        return _pending_payload(pending)
+    if int(pending.chat_id or 0) != int(payload.chat_id):
         raise HTTPException(status_code=401, detail='telegram chat mismatch')
-    if twofa.status == 'pending':
-        twofa.status = 'approved' if payload.decision == 'approve' else 'denied'
-        repo.save_twofa_session(twofa)
-    return {'status': twofa.status}
+    if payload.decision == 'deny':
+        pending.status = 'denied'; repo.save_pending_action(pending); return _pending_payload(pending)
+    subject = repo.get_subject(pending.subject_id)
+    if subject is None:
+        return {'status': 'expired'}
+    if pending.action == 'enable':
+        repo.update_twofa_settings(subject, method='telegram')
+    elif pending.action == 'disable':
+        repo.update_twofa_settings(subject, method='none')
+    pending.status = 'approved'; repo.save_pending_action(pending)
+    return _pending_payload(pending)
+
+
+
+@app.get('/api/v1/internal/accounts/{subject_id}/twofa')
+def internal_get_twofa_settings(subject_id: str, session: SessionDep, x_internal_key: str | None = Header(default=None)):
+    _require_internal(x_internal_key)
+    return _settings_payload(IdentityRepository(session), subject_id)
+
+
+@app.post('/api/v1/internal/accounts/{subject_id}/twofa/method')
+def internal_set_twofa_method(subject_id: str, payload: TwoFASetMethodRequest, session: SessionDep, x_internal_key: str | None = Header(default=None)):
+    _require_internal(x_internal_key)
+    repo = IdentityRepository(session)
+    subject = repo.get_subject(subject_id)
+    if subject is None:
+        raise HTTPException(status_code=404, detail='subject not found')
+    method = _normalize_twofa_method(payload.method)
+    if method == 'telegram' and repo.get_telegram_link_by_subject(subject_id) is None:
+        raise HTTPException(status_code=400, detail='telegram not linked')
+    if method == 'totp' and not subject.twofa_totp_secret:
+        raise HTTPException(status_code=400, detail='totp not configured')
+    repo.update_twofa_settings(subject, method=method)
+    return {'ok': True}
+
+
+@app.post('/api/v1/internal/accounts/{subject_id}/twofa/totp/setup')
+def internal_totp_setup(subject_id: str, session: SessionDep, x_internal_key: str | None = Header(default=None)):
+    _require_internal(x_internal_key)
+    repo = IdentityRepository(session)
+    subject = repo.get_subject(subject_id)
+    if subject is None:
+        raise HTTPException(status_code=404, detail='subject not found')
+    secret = generate_totp_secret()
+    pending = repo.create_pending_action(subject_id=subject_id, method='totp', action='setup', secret=secret)
+    issuer = 'Nerior'
+    account = subject.email or subject.username or subject.id
+    from urllib.parse import quote
+    return {'pending_id': pending.id, 'secret': secret, 'otpauth_uri': f'otpauth://totp/{quote(issuer + ":" + account)}?secret={quote(secret)}&issuer={quote(issuer)}&algorithm=SHA1&digits=6&period=30', 'expires_at': pending.expires_at.isoformat()}
+
+
+@app.post('/api/v1/internal/accounts/{subject_id}/twofa/totp/verify-setup')
+def internal_totp_verify_setup(subject_id: str, payload: TotpSetupVerifyRequest, session: SessionDep, x_internal_key: str | None = Header(default=None)):
+    _require_internal(x_internal_key)
+    repo = IdentityRepository(session)
+    pending = repo.get_pending_action(payload.pending_id)
+    if pending is None or pending.subject_id != subject_id or pending.method != 'totp' or pending.action != 'setup':
+        raise HTTPException(status_code=400, detail='invalid pending action')
+    pending = _expire_pending_if_needed(repo, pending)
+    if pending.status != 'pending' or not pending.secret:
+        raise HTTPException(status_code=400, detail='pending action expired')
+    ok, _ = verify_totp(pending.secret, _normalize_code(payload.code))
+    if not ok:
+        raise HTTPException(status_code=400, detail='invalid totp code')
+    subject = repo.get_subject(subject_id)
+    if subject is None:
+        raise HTTPException(status_code=404, detail='subject not found')
+    repo.update_twofa_settings(subject, method='totp', totp_secret=pending.secret, clear_last_totp_step=True)
+    pending.status = 'approved'; repo.save_pending_action(pending)
+    return {'ok': True}
+
+
+@app.post('/api/v1/internal/accounts/{subject_id}/twofa/totp/disable')
+def internal_totp_disable(subject_id: str, payload: TotpDisableRequest, session: SessionDep, x_internal_key: str | None = Header(default=None)):
+    _require_internal(x_internal_key)
+    repo = IdentityRepository(session)
+    subject = repo.get_subject(subject_id)
+    if subject is None or not subject.twofa_totp_secret:
+        raise HTTPException(status_code=400, detail='totp not configured')
+    ok, step = verify_totp(subject.twofa_totp_secret, _normalize_code(payload.code))
+    if not ok or step is None or (subject.twofa_last_totp_step is not None and step <= subject.twofa_last_totp_step):
+        raise HTTPException(status_code=400, detail='invalid totp code')
+    method = 'none' if _normalize_twofa_method(subject.twofa_method) == 'totp' else None
+    repo.update_twofa_settings(subject, method=method, clear_totp_secret=True, last_totp_step=step)
+    return {'ok': True}
+
+
+@app.post('/api/v1/internal/accounts/{subject_id}/twofa/telegram/{action}-request')
+def internal_telegram_settings_request(subject_id: str, action: Literal['enable','disable'], session: SessionDep, x_internal_key: str | None = Header(default=None)):
+    _require_internal(x_internal_key)
+    repo = IdentityRepository(session)
+    subject = repo.get_subject(subject_id)
+    if subject is None:
+        raise HTTPException(status_code=404, detail='subject not found')
+    link = repo.get_telegram_link_by_subject(subject_id)
+    if link is None:
+        raise HTTPException(status_code=400, detail='telegram not linked')
+    if action == 'enable' and _normalize_twofa_method(subject.twofa_method) == 'telegram':
+        raise HTTPException(status_code=400, detail='telegram 2fa already enabled')
+    if action == 'disable' and _normalize_twofa_method(subject.twofa_method) != 'telegram':
+        raise HTTPException(status_code=400, detail='telegram 2fa is not enabled')
+    pending = repo.create_pending_action(subject_id=subject_id, method='telegram', action=action, chat_id=int(link.telegram_chat_id))
+    twofa_client.send_telegram_settings_message(int(link.telegram_chat_id), action, pending.id)
+    return _pending_payload(pending)
+
+
+@app.get('/api/v1/internal/accounts/{subject_id}/twofa/pending/{pending_id}')
+def internal_twofa_pending_status(subject_id: str, pending_id: str, session: SessionDep, x_internal_key: str | None = Header(default=None)):
+    _require_internal(x_internal_key)
+    repo = IdentityRepository(session)
+    pending = repo.get_pending_action(pending_id)
+    if pending is None:
+        return {'pending_id': pending_id, 'method': 'telegram', 'action': 'unknown', 'status': 'expired', 'expires_at': None}
+    if pending.subject_id != subject_id:
+        raise HTTPException(status_code=401, detail='pending action does not belong to subject')
+    pending = _expire_pending_if_needed(repo, pending)
+    return _pending_payload(pending)
 
 @app.post('/api/v1/internal/accounts')
 def upsert_account(payload: AccountUpsert, session: SessionDep, x_internal_key: str | None = Header(default=None)):

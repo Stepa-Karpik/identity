@@ -61,3 +61,49 @@ def test_telegram_2fa_approval_is_stored_in_identity(monkeypatch):
     complete = client.post('/api/v1/twofa/telegram/complete', json={'twofa_session_id': challenge['twofa_session_id']})
     assert complete.status_code == 200
     assert complete.cookies['ecosystem_session'].startswith('sess_')
+
+
+def test_internal_totp_settings_are_owned_by_identity():
+    client, factory = make_client()
+    with factory() as session:
+        IdentityRepository(session).upsert_account(subject_id='usr_settings', email='s@example.com', username='settings', password_hash=hash_password('supersecret'))
+
+    setup = client.post('/api/v1/internal/accounts/usr_settings/twofa/totp/setup', headers={'x-internal-key': 'dev-internal-key'})
+    assert setup.status_code == 200
+    data = setup.json()
+    code = totp_code(data['secret'])
+
+    verify = client.post(
+        '/api/v1/internal/accounts/usr_settings/twofa/totp/verify-setup',
+        headers={'x-internal-key': 'dev-internal-key'},
+        json={'pending_id': data['pending_id'], 'code': code},
+    )
+    assert verify.status_code == 200
+
+    settings = client.get('/api/v1/internal/accounts/usr_settings/twofa', headers={'x-internal-key': 'dev-internal-key'})
+    assert settings.status_code == 200
+    assert settings.json()['twofa_method'] == 'totp'
+    assert settings.json()['totp_enabled'] is True
+
+
+def test_internal_telegram_settings_callback_updates_identity(monkeypatch):
+    sent = []
+    monkeypatch.setattr('app.twofa.send_telegram_settings_message', lambda chat_id, action, pending_id: sent.append((chat_id, action, pending_id)))
+    client, factory = make_client()
+    with factory() as session:
+        repo = IdentityRepository(session)
+        repo.upsert_account(subject_id='usr_tg_settings', email='ts@example.com', username='tgsettings', password_hash=hash_password('supersecret'))
+        repo.upsert_telegram_link(subject_id='usr_tg_settings', chat_id=777, username='tguser')
+
+    request = client.post('/api/v1/internal/accounts/usr_tg_settings/twofa/telegram/enable-request', headers={'x-internal-key': 'dev-internal-key'})
+    assert request.status_code == 200
+    pending_id = request.json()['pending_id']
+    assert sent == [(777, 'enable', pending_id)]
+
+    callback = client.post('/api/v1/internal/twofa/telegram/callback', json={'chat_id':777,'twofa_session_id':pending_id,'decision':'approve'}, headers={'x-internal-key':'dev-internal-key'})
+    assert callback.status_code == 200
+    assert callback.json()['status'] == 'approved'
+
+    settings = client.get('/api/v1/internal/accounts/usr_tg_settings/twofa', headers={'x-internal-key': 'dev-internal-key'})
+    assert settings.json()['twofa_method'] == 'telegram'
+    assert settings.json()['telegram_confirmed'] is True
