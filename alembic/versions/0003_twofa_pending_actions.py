@@ -12,7 +12,7 @@ def upgrade() -> None:
     op.create_table(
         'twofa_pending_actions',
         sa.Column('id', sa.String(length=64), primary_key=True),
-        sa.Column('subject_id', sa.String(length=128), nullable=False, index=True),
+        sa.Column('subject_id', sa.String(length=128), nullable=False),
         sa.Column('chat_id', sa.BigInteger(), nullable=True),
         sa.Column('method', sa.String(length=16), nullable=False),
         sa.Column('action', sa.String(length=24), nullable=False),
